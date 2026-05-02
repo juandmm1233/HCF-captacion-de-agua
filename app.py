@@ -368,11 +368,21 @@ def main() -> None:
         """
         <style>
         .block-container { padding-top: 1.2rem; }
+        /* Tarjetas KPI: fondo claro + texto oscuro (el tema oscuro de Streamlit dejaba cifras ilegibles). */
         div[data-testid="stMetric"] {
             background-color: #f8fafc;
             border: 1px solid #e2e8f0;
             border-radius: 10px;
             padding: 12px 16px;
+            color: #0f172a;
+        }
+        div[data-testid="stMetric"] label,
+        div[data-testid="stMetric"] p,
+        div[data-testid="stMetric"] span,
+        div[data-testid="stMetric"] [data-testid="stMetricLabel"],
+        div[data-testid="stMetric"] [data-testid="stMetricValue"] {
+            color: #0f172a !important;
+            -webkit-text-fill-color: #0f172a !important;
         }
         h1 { letter-spacing: -0.02em; }
         .ucc-sub { color: #64748b; font-size: 0.95rem; margin-top: -0.5rem; }
