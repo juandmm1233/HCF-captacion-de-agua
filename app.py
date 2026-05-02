@@ -154,11 +154,77 @@ def simular_aprovechamiento(
     )
 
 
+def formato_miles_colombiano(val: float, decimales: int = 0, prefijo: str = "") -> str:
+    """
+    Formato numérico tipo Colombia: punto como separador de miles; coma decimal si decimales > 0.
+    Útil para métricas, ejes y hovers (COP sin decimales; m³ con 2 decimales si aplica).
+    """
+    if decimales <= 0:
+        entero = int(round(val))
+        neg = entero < 0
+        entero = abs(entero)
+        grupo = f"{entero:,}".replace(",", ".")
+        return f"{prefijo}{'-' if neg else ''}{grupo}"
+    s_us = format(val, f",.{decimales}f")
+    return prefijo + s_us.replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def formato_cop_miles(val: float) -> str:
+    return formato_miles_colombiano(val, decimales=0, prefijo="$ ")
+
+
+def agregar_columnas_lluvia_y_economia(resultado: pd.DataFrame, tarifa_cop_m3: float) -> pd.DataFrame:
+    """
+    Agua lluvia consumida = demanda cubierta sin usar red.
+    Ahorro diario (COP) = volumen de lluvia utilizado × tarifa; acumulados para m³ y COP.
+    """
+    out = resultado.copy()
+    out["Agua_Lluvia_Consumida_m3"] = out["Consumo_m3"] - out["Agua_Potable_Suple_m3"]
+    out["Ahorro_Diario_COP"] = out["Agua_Lluvia_Consumida_m3"] * tarifa_cop_m3
+    out["Ahorro_Acumulado_COP"] = out["Ahorro_Diario_COP"].cumsum()
+    out["Agua_Lluvia_Acumulada_m3"] = out["Agua_Lluvia_Consumida_m3"].cumsum()
+    return out
+
+
+def ahorro_anual_proyectado_cop(resultado_eco: pd.DataFrame) -> float:
+    """Escala el ahorro del periodo simulado a 365 días."""
+    dias = len(resultado_eco)
+    if dias <= 0:
+        return 0.0
+    return float(resultado_eco["Ahorro_Diario_COP"].sum()) * (365.0 / dias)
+
+
+def punto_equilibrio_anos(inversion_cop: float, ahorro_anual_cop: float) -> float | None:
+    """Años para recuperar inversión (payback simple). None si no aplica."""
+    if inversion_cop <= 0 or ahorro_anual_cop <= 0:
+        return None
+    return inversion_cop / ahorro_anual_cop
+
+
+def roi_anual_simple_pct(inversion_cop: float, ahorro_anual_cop: float) -> float | None:
+    """Retorno simple sobre inversión anualizada (solo referencia; no incluye valor temporal del dinero)."""
+    if inversion_cop <= 0:
+        return None
+    return 100.0 * ahorro_anual_cop / inversion_cop
+
+
+def build_excel_captacion_rebose_y_completo(resultado_eco: pd.DataFrame) -> bytes:
+    """Genera un .xlsx con hoja Captación vs rebalse y hoja con serie completa."""
+    buf = io.BytesIO()
+    cap_reb = resultado_eco[[COL_FECHA, "Captacion_m3", "Rebose_m3"]].copy()
+    cap_reb[COL_FECHA] = pd.to_datetime(cap_reb[COL_FECHA]).dt.strftime("%Y-%m-%d")
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        cap_reb.to_excel(writer, index=False, sheet_name="Captacion_Rebose")
+        full = resultado_eco.copy()
+        full[COL_FECHA] = pd.to_datetime(full[COL_FECHA]).dt.strftime("%Y-%m-%d")
+        full.to_excel(writer, index=False, sheet_name="Resultados_Completos")
+    return buf.getvalue()
+
+
 def calcular_kpis(resultado: pd.DataFrame) -> dict[str, float]:
     """KPIs agregados a partir de la serie simulada."""
     total_demanda = float(resultado["Consumo_m3"].sum())
     total_potable = float(resultado["Agua_Potable_Suple_m3"].sum())
-    # Agua “ahorrada” = volumen de demanda satisfecho con agua captada (no con red)
     total_ahorrado = total_demanda - total_potable
     eficiencia_pct = (100.0 * total_ahorrado / total_demanda) if total_demanda > 0 else 0.0
     return {
@@ -167,6 +233,102 @@ def calcular_kpis(resultado: pd.DataFrame) -> dict[str, float]:
         "eficiencia_pct": eficiencia_pct,
         "total_demanda_m3": total_demanda,
     }
+
+
+def grafico_captacion_vs_rebose(resultado: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=resultado[COL_FECHA],
+            y=resultado["Captacion_m3"],
+            name="Captación (m³/día)",
+            marker_color="#0ea5e9",
+        )
+    )
+    fig.add_trace(
+        go.Bar(
+            x=resultado[COL_FECHA],
+            y=resultado["Rebose_m3"],
+            name="Rebose (m³/día)",
+            marker_color="#94a3b8",
+        )
+    )
+    fig.update_layout(
+        title="Captación diaria vs. rebalse",
+        barmode="group",
+        xaxis_title="Fecha",
+        yaxis_title="Volumen (m³)",
+        template="plotly_white",
+        hovermode="x unified",
+        margin=dict(l=40, r=20, t=50, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    return fig
+
+
+def grafico_ahorro_acumulado_dual(resultado_eco: pd.DataFrame) -> go.Figure:
+    fechas = resultado_eco[COL_FECHA]
+    y_m3 = resultado_eco["Agua_Lluvia_Acumulada_m3"].astype(float)
+    y_cop = resultado_eco["Ahorro_Acumulado_COP"].astype(float)
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=fechas,
+            y=y_m3,
+            name="Agua lluvia utilizada acum. (m³)",
+            mode="lines",
+            line=dict(color="#0369a1", width=2),
+            yaxis="y",
+            customdata=[formato_miles_colombiano(float(v), decimales=2) + " m³" for v in y_m3],
+            hovertemplate="%{x|%Y-%m-%d}<br>Acumulado: %{customdata}<extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=fechas,
+            y=y_cop,
+            name="Ahorro acumulado (COP)",
+            mode="lines",
+            line=dict(color="#059669", width=2),
+            yaxis="y2",
+            customdata=[formato_cop_miles(float(v)) for v in y_cop],
+            hovertemplate="%{x|%Y-%m-%d}<br>Ahorro acum.: %{customdata}<extra></extra>",
+        )
+    )
+
+    y1_max = float(np.nanmax(y_m3)) if len(y_m3) else 0.0
+    y2_max = float(np.nanmax(y_cop)) if len(y_cop) else 0.0
+    nt = 6
+    t1 = np.linspace(0, max(y1_max * 1.05, 1e-9), nt)
+    t2 = np.linspace(0, max(y2_max * 1.05, 1e-9), nt)
+
+    fig.update_layout(
+        title="Ahorro acumulado: volumen de lluvia utilizada y valor en COP",
+        xaxis_title="Fecha",
+        template="plotly_white",
+        hovermode="x unified",
+        margin=dict(l=55, r=70, t=50, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.06, xanchor="center", x=0.5),
+        yaxis=dict(
+            title=dict(text="Acumulado (m³)"),
+            side="left",
+            showgrid=True,
+            tickmode="array",
+            tickvals=t1,
+            ticktext=[formato_miles_colombiano(float(t), decimales=2) for t in t1],
+        ),
+        yaxis2=dict(
+            title=dict(text="Ahorro acumulado (COP)"),
+            overlaying="y",
+            side="right",
+            showgrid=False,
+            tickmode="array",
+            tickvals=t2,
+            ticktext=[formato_cop_miles(float(t)) for t in t2],
+        ),
+    )
+    return fig
 
 
 def grafico_nivel_tanque(resultado: pd.DataFrame) -> go.Figure:
@@ -248,6 +410,24 @@ def main() -> None:
         stock0 = st.number_input("Stock inicial del tanque (m³)", min_value=0.0, value=0.0, step=0.5)
 
         st.divider()
+        st.subheader("Economía")
+        tarifa_cop_m3 = st.number_input(
+            "Tarifa de agua (COP/m³)",
+            min_value=0.0,
+            value=4800.0,
+            step=100.0,
+            format="%.0f",
+        )
+        inversion_cop = st.number_input(
+            "Costo de inversión inicial (COP)",
+            min_value=0.0,
+            value=0.0,
+            step=500_000.0,
+            format="%.0f",
+            help="Para estimar punto de equilibrio (payback) y ROI anual simple.",
+        )
+
+        st.divider()
         st.subheader("Datos de precipitación")
         archivo = st.file_uploader(
             "Subir CSV o Excel",
@@ -277,38 +457,79 @@ def main() -> None:
         consumo_diario_m3=consumo,
         stock_inicial_m3=stock0,
     )
+    resultado_eco = agregar_columnas_lluvia_y_economia(resultado, tarifa_cop_m3)
     kpis = calcular_kpis(resultado)
+    ahorro_anual = ahorro_anual_proyectado_cop(resultado_eco)
+    payback = punto_equilibrio_anos(inversion_cop, ahorro_anual)
+    roi_pct = roi_anual_simple_pct(inversion_cop, ahorro_anual)
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
         st.metric(
             "Total agua ahorrada (m³)",
-            f"{kpis['total_ahorrado_m3']:.2f}",
+            formato_miles_colombiano(kpis["total_ahorrado_m3"], decimales=2),
             help="Volumen de demanda cubierto con agua captada (no con red potable).",
         )
     with c2:
         st.metric(
             "Total agua potable usada (m³)",
-            f"{kpis['total_potable_m3']:.2f}",
+            formato_miles_colombiano(kpis["total_potable_m3"], decimales=2),
             help="Suplemento de red cuando el tanque no cubre el consumo diario.",
         )
     with c3:
         st.metric(
             "Eficiencia de cobertura (%)",
-            f"{kpis['eficiencia_pct']:.1f}",
+            formato_miles_colombiano(kpis["eficiencia_pct"], decimales=1),
             help="Agua ahorrada / demanda total × 100.",
         )
+    with c4:
+        st.metric(
+            "Ahorro total anual proyectado (COP)",
+            formato_cop_miles(ahorro_anual),
+            help="Escala el ahorro monetario del periodo simulado a 365 días, "
+            "con la tarifa indicada.",
+        )
+
+    e1, e2, e3 = st.columns(3)
+    with e1:
+        st.metric("Inversión inicial (COP)", formato_cop_miles(inversion_cop))
+    with e2:
+        st.metric(
+            "Punto de equilibrio (años)",
+            f"{payback:.2f}".replace(".", ",") if payback is not None else "—",
+            help="Inversión ÷ ahorro anual proyectado.",
+        )
+    with e3:
+        st.metric(
+            "ROI anual simple (%)",
+            formato_miles_colombiano(roi_pct, decimales=1) if roi_pct is not None else "—",
+            help="Ahorro anual proyectado ÷ inversión × 100. No incluye TRM ni costos de O&M.",
+        )
+
     st.caption(f"Origen de precipitación: {st.session_state.get('origen_datos', '—')}")
 
-    st.plotly_chart(grafico_nivel_tanque(resultado), use_container_width=True)
+    st.plotly_chart(grafico_nivel_tanque(resultado_eco), use_container_width=True)
+
+    st.subheader("Captación vs. rebalse")
+    st.plotly_chart(grafico_captacion_vs_rebose(resultado_eco), use_container_width=True)
+    excel_bytes = build_excel_captacion_rebose_y_completo(resultado_eco)
+    st.download_button(
+        label="Descargar Excel (captación/rebalse y resultados completos)",
+        data=excel_bytes,
+        file_name=f"captacion_rebalse_UCC_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    st.subheader("Economía: ahorro acumulado")
+    st.plotly_chart(grafico_ahorro_acumulado_dual(resultado_eco), use_container_width=True)
 
     st.subheader("Tabla de resultados")
-    display_df = resultado.copy()
+    display_df = resultado_eco.copy()
     display_df[COL_FECHA] = pd.to_datetime(display_df[COL_FECHA]).dt.strftime("%Y-%m-%d")
 
     st.dataframe(display_df, use_container_width=True, height=320)
 
-    csv_bytes = resultado.to_csv(index=False).encode("utf-8-sig")
+    csv_bytes = resultado_eco.to_csv(index=False).encode("utf-8-sig")
     st.download_button(
         label="Descargar resultados (CSV)",
         data=csv_bytes,
@@ -323,6 +544,9 @@ def main() -> None:
             - **Captación**: entra al tanque según lámina de lluvia, área y coeficientes.
             - **Rebose**: excedente respecto a la capacidad; no queda almacenado.
             - **Consumo**: salida fija diaria; primero se usa el stock; el déficit es **agua potable suplementaria**.
+            - **Agua lluvia consumida**: volumen diario de demanda cubierto sin recurrir a la red.
+            - **Ahorro diario (COP)**: agua lluvia consumida × tarifa; el **ahorro acumulado** es la suma en el tiempo.
+            - **Punto de equilibrio**: reparto simple de la inversión inicial sobre el ahorro anualizado.
             """
         )
 
