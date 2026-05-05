@@ -1,362 +1,44 @@
 """
-Simulación dinámica de aprovechamiento de agua lluvia — Universidad Cooperativa de Colombia (UCC).
+Aplicación Streamlit — Simulación de aprovechamiento de agua lluvia (UCC).
 
-Motor basado en balance de masas (stocks y flujos): el tanque acumula entradas (captación)
-y salidas (consumo), con límites físicos (rebalse) y cobertura de déficit con agua potable.
+La lógica de simulación, datos y gráficos está en ``simulacion.py``;
+este archivo solo define la interfaz web.
 """
 
 from __future__ import annotations
 
-import io
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
 
-import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
 
-
-# --- Constantes de columnas esperadas ---
-COL_FECHA = "Fecha"
-COL_PRECIP = "Precipitacion_mm"
-
-
-def generar_precipitacion_sintetica(
-    dias: int = 365,
-    fecha_inicio: datetime | None = None,
-    seed: int = 42,
-) -> pd.DataFrame:
-    """
-    Genera una serie diaria sintética de precipitación (mm) con estacionalidad húmeda/seca.
-    Permite usar la app sin archivo de entrada.
-    """
-    rng = np.random.default_rng(seed)
-    if fecha_inicio is None:
-        fecha_inicio = datetime(2025, 1, 1)
-    fechas = [fecha_inicio + timedelta(days=i) for i in range(dias)]
-    # Índice día del año 0..364 para patrón estacional (Colombia: mayor lluvia en mitad de año aprox.)
-    doy = np.array([d.timetuple().tm_yday - 1 for d in fechas])
-    estacional = 8.0 + 6.0 * np.sin(2 * np.pi * (doy - 80) / 365.0)
-    ruido = rng.gamma(shape=1.2, scale=2.5, size=dias)
-    precip = np.maximum(estacional + ruido - 3.0, 0.0)
-    return pd.DataFrame({COL_FECHA: fechas, COL_PRECIP: precip})
+from simulacion import (
+    COL_FECHA,
+    COL_PRECIP,
+    agregar_columnas_lluvia_y_economia,
+    ahorro_anual_proyectado_cop,
+    build_excel_captacion_rebose_y_completo,
+    calcular_kpis,
+    cargar_precipitaciones,
+    filtrar_precip_por_rango,
+    formato_cop_miles,
+    formato_miles_colombiano,
+    generar_precipitacion_sintetica,
+    grafico_ahorro_acumulado_dual,
+    grafico_captacion_vs_rebose,
+    grafico_nivel_tanque,
+    punto_equilibrio_anos,
+    roi_anual_simple_pct,
+    simular_aprovechamiento,
+)
 
 
-def normalizar_columnas(df: pd.DataFrame) -> pd.DataFrame:
-    """Mapea variantes de nombres de columnas a Fecha y Precipitacion_mm."""
-    col_map = {c.lower().strip(): c for c in df.columns}
-    ren: dict[str, str] = {}
-    for key, canon in [
-        ("fecha", COL_FECHA),
-        ("date", COL_FECHA),
-        ("precipitacion_mm", COL_PRECIP),
-        ("precipitación_mm", COL_PRECIP),
-        ("precipitacion", COL_PRECIP),
-        ("precip", COL_PRECIP),
-        ("p_mm", COL_PRECIP),
-    ]:
-        if key in col_map:
-            ren[col_map[key]] = canon
-    out = df.rename(columns=ren)
-    if COL_FECHA not in out.columns or COL_PRECIP not in out.columns:
-        raise ValueError(
-            "El archivo debe incluir columnas de fecha y precipitación "
-            f"(ej. '{COL_FECHA}', '{COL_PRECIP}')."
-        )
-    out = out[[COL_FECHA, COL_PRECIP]].copy()
-    out[COL_FECHA] = pd.to_datetime(out[COL_FECHA], errors="coerce")
-    out[COL_PRECIP] = pd.to_numeric(out[COL_PRECIP], errors="coerce")
-    out = out.dropna(subset=[COL_FECHA, COL_PRECIP])
-    out = out.sort_values(COL_FECHA).reset_index(drop=True)
-    return out
-
-
-def cargar_precipitaciones(uploaded) -> pd.DataFrame:
-    """Lee CSV o Excel desde el objeto de subida de Streamlit."""
-    name = (uploaded.name or "").lower()
-    if name.endswith(".csv"):
-        df = pd.read_csv(uploaded)
-    elif name.endswith((".xlsx", ".xls")):
-        df = pd.read_excel(uploaded)
-    else:
-        raise ValueError("Formato no soportado. Use CSV o Excel (.csv, .xlsx).")
-    return normalizar_columnas(df)
-
-
-def simular_aprovechamiento(
-    precip_df: pd.DataFrame,
-    area_captacion_m2: float,
-    coef_escorrentia: float,
-    eficiencia: float,
-    capacidad_tanque_m3: float,
-    consumo_diario_m3: float,
-    stock_inicial_m3: float = 0.0,
-) -> pd.DataFrame:
-    """
-    Simulación día a día (stocks y flujos):
-
-    1) Captación (flujo de entrada, m³/día):
-       Profundidad convertida a volumen: h(m) = Precip(mm)/1000.
-       Volumen bruto = h * Área(m²). Se aplican coef. escorrentía y eficiencia del sistema.
-
-    2) Tras la captación, el stock provisional puede superar la capacidad → rebalse (pérdida)
-       y el stock se recorta al máximo físico.
-
-    3) Consumo (flujo de salida): si el stock cubre el consumo, se usa solo agua de lluvia;
-       si no, se completa con agua potable suplementaria y el stock queda en 0.
-    """
-    n = len(precip_df)
-    fechas = precip_df[COL_FECHA].values
-    precip_mm = precip_df[COL_PRECIP].astype(float).values
-
-    stock = np.zeros(n)
-    captacion = np.zeros(n)
-    rebalse = np.zeros(n)
-    agua_potable = np.zeros(n)
-    consumo_arr = np.full(n, consumo_diario_m3)
-
-    s = float(stock_inicial_m3)
-
-    for i in range(n):
-        # Captación: mm → m de lámina; * área (m²) → m³
-        cap = (
-            (precip_mm[i] / 1000.0)
-            * area_captacion_m2
-            * coef_escorrentia
-            * eficiencia
-        )
-        captacion[i] = cap
-        # Stock después de entrada
-        s = s + cap
-        if s > capacidad_tanque_m3:
-            rebalse[i] = s - capacidad_tanque_m3
-            s = capacidad_tanque_m3
-        # Consumo y déficit
-        dem = consumo_diario_m3
-        if s >= dem:
-            s = s - dem
-            agua_potable[i] = 0.0
-        else:
-            agua_potable[i] = dem - s
-            s = 0.0
-        stock[i] = s
-
-    return pd.DataFrame(
-        {
-            COL_FECHA: fechas,
-            COL_PRECIP: precip_mm,
-            "Captacion_m3": captacion,
-            "Rebose_m3": rebalse,
-            "Consumo_m3": consumo_arr,
-            "Agua_Potable_Suple_m3": agua_potable,
-            "Stock_Tanque_m3": stock,
-        }
-    )
-
-
-def formato_miles_colombiano(val: float, decimales: int = 0, prefijo: str = "") -> str:
-    """
-    Formato numérico tipo Colombia: punto como separador de miles; coma decimal si decimales > 0.
-    Útil para métricas, ejes y hovers (COP sin decimales; m³ con 2 decimales si aplica).
-    """
-    if decimales <= 0:
-        entero = int(round(val))
-        neg = entero < 0
-        entero = abs(entero)
-        grupo = f"{entero:,}".replace(",", ".")
-        return f"{prefijo}{'-' if neg else ''}{grupo}"
-    s_us = format(val, f",.{decimales}f")
-    return prefijo + s_us.replace(",", "X").replace(".", ",").replace("X", ".")
-
-
-def formato_cop_miles(val: float) -> str:
-    return formato_miles_colombiano(val, decimales=0, prefijo="$ ")
-
-
-def agregar_columnas_lluvia_y_economia(resultado: pd.DataFrame, tarifa_cop_m3: float) -> pd.DataFrame:
-    """
-    Agua lluvia consumida = demanda cubierta sin usar red.
-    Ahorro diario (COP) = volumen de lluvia utilizado × tarifa; acumulados para m³ y COP.
-    """
-    out = resultado.copy()
-    out["Agua_Lluvia_Consumida_m3"] = out["Consumo_m3"] - out["Agua_Potable_Suple_m3"]
-    out["Ahorro_Diario_COP"] = out["Agua_Lluvia_Consumida_m3"] * tarifa_cop_m3
-    out["Ahorro_Acumulado_COP"] = out["Ahorro_Diario_COP"].cumsum()
-    out["Agua_Lluvia_Acumulada_m3"] = out["Agua_Lluvia_Consumida_m3"].cumsum()
-    return out
-
-
-def ahorro_anual_proyectado_cop(resultado_eco: pd.DataFrame) -> float:
-    """Escala el ahorro del periodo simulado a 365 días."""
-    dias = len(resultado_eco)
-    if dias <= 0:
-        return 0.0
-    return float(resultado_eco["Ahorro_Diario_COP"].sum()) * (365.0 / dias)
-
-
-def punto_equilibrio_anos(inversion_cop: float, ahorro_anual_cop: float) -> float | None:
-    """Años para recuperar inversión (payback simple). None si no aplica."""
-    if inversion_cop <= 0 or ahorro_anual_cop <= 0:
-        return None
-    return inversion_cop / ahorro_anual_cop
-
-
-def roi_anual_simple_pct(inversion_cop: float, ahorro_anual_cop: float) -> float | None:
-    """Retorno simple sobre inversión anualizada (solo referencia; no incluye valor temporal del dinero)."""
-    if inversion_cop <= 0:
-        return None
-    return 100.0 * ahorro_anual_cop / inversion_cop
-
-
-def build_excel_captacion_rebose_y_completo(resultado_eco: pd.DataFrame) -> bytes:
-    """Genera un .xlsx con hoja Captación vs rebalse y hoja con serie completa."""
-    buf = io.BytesIO()
-    cap_reb = resultado_eco[[COL_FECHA, "Captacion_m3", "Rebose_m3"]].copy()
-    cap_reb[COL_FECHA] = pd.to_datetime(cap_reb[COL_FECHA]).dt.strftime("%Y-%m-%d")
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        cap_reb.to_excel(writer, index=False, sheet_name="Captacion_Rebose")
-        full = resultado_eco.copy()
-        full[COL_FECHA] = pd.to_datetime(full[COL_FECHA]).dt.strftime("%Y-%m-%d")
-        full.to_excel(writer, index=False, sheet_name="Resultados_Completos")
-    return buf.getvalue()
-
-
-def calcular_kpis(resultado: pd.DataFrame) -> dict[str, float]:
-    """KPIs agregados a partir de la serie simulada."""
-    total_demanda = float(resultado["Consumo_m3"].sum())
-    total_potable = float(resultado["Agua_Potable_Suple_m3"].sum())
-    total_ahorrado = total_demanda - total_potable
-    eficiencia_pct = (100.0 * total_ahorrado / total_demanda) if total_demanda > 0 else 0.0
-    return {
-        "total_ahorrado_m3": total_ahorrado,
-        "total_potable_m3": total_potable,
-        "eficiencia_pct": eficiencia_pct,
-        "total_demanda_m3": total_demanda,
-    }
-
-
-def grafico_captacion_vs_rebose(resultado: pd.DataFrame) -> go.Figure:
-    fig = go.Figure()
-    fig.add_trace(
-        go.Bar(
-            x=resultado[COL_FECHA],
-            y=resultado["Captacion_m3"],
-            name="Captación (m³/día)",
-            marker_color="#0ea5e9",
-        )
-    )
-    fig.add_trace(
-        go.Bar(
-            x=resultado[COL_FECHA],
-            y=resultado["Rebose_m3"],
-            name="Rebose (m³/día)",
-            marker_color="#94a3b8",
-        )
-    )
-    fig.update_layout(
-        title="Captación diaria vs. rebalse",
-        barmode="group",
-        xaxis_title="Fecha",
-        yaxis_title="Volumen (m³)",
-        template="plotly_white",
-        hovermode="x unified",
-        margin=dict(l=40, r=20, t=50, b=40),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-    )
-    return fig
-
-
-def grafico_ahorro_acumulado_dual(resultado_eco: pd.DataFrame) -> go.Figure:
-    fechas = resultado_eco[COL_FECHA]
-    y_m3 = resultado_eco["Agua_Lluvia_Acumulada_m3"].astype(float)
-    y_cop = resultado_eco["Ahorro_Acumulado_COP"].astype(float)
-
-    fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=fechas,
-            y=y_m3,
-            name="Agua lluvia utilizada acum. (m³)",
-            mode="lines",
-            line=dict(color="#0369a1", width=2),
-            yaxis="y",
-            customdata=[formato_miles_colombiano(float(v), decimales=2) + " m³" for v in y_m3],
-            hovertemplate="%{x|%Y-%m-%d}<br>Acumulado: %{customdata}<extra></extra>",
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=fechas,
-            y=y_cop,
-            name="Ahorro acumulado (COP)",
-            mode="lines",
-            line=dict(color="#059669", width=2),
-            yaxis="y2",
-            customdata=[formato_cop_miles(float(v)) for v in y_cop],
-            hovertemplate="%{x|%Y-%m-%d}<br>Ahorro acum.: %{customdata}<extra></extra>",
-        )
-    )
-
-    y1_max = float(np.nanmax(y_m3)) if len(y_m3) else 0.0
-    y2_max = float(np.nanmax(y_cop)) if len(y_cop) else 0.0
-    nt = 6
-    t1 = np.linspace(0, max(y1_max * 1.05, 1e-9), nt)
-    t2 = np.linspace(0, max(y2_max * 1.05, 1e-9), nt)
-
-    fig.update_layout(
-        title="Ahorro acumulado: volumen de lluvia utilizada y valor en COP",
-        xaxis_title="Fecha",
-        template="plotly_white",
-        hovermode="x unified",
-        margin=dict(l=55, r=70, t=50, b=40),
-        legend=dict(orientation="h", yanchor="bottom", y=1.06, xanchor="center", x=0.5),
-        yaxis=dict(
-            title=dict(text="Acumulado (m³)"),
-            side="left",
-            showgrid=True,
-            tickmode="array",
-            tickvals=t1,
-            ticktext=[formato_miles_colombiano(float(t), decimales=2) for t in t1],
-        ),
-        yaxis2=dict(
-            title=dict(text="Ahorro acumulado (COP)"),
-            overlaying="y",
-            side="right",
-            showgrid=False,
-            tickmode="array",
-            tickvals=t2,
-            ticktext=[formato_cop_miles(float(t)) for t in t2],
-        ),
-    )
-    return fig
-
-
-def grafico_nivel_tanque(resultado: pd.DataFrame) -> go.Figure:
-    fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=resultado[COL_FECHA],
-            y=resultado["Stock_Tanque_m3"],
-            mode="lines",
-            name="Nivel del tanque (m³)",
-            line=dict(color="#1f77b4", width=2),
-            fill="tozeroy",
-            fillcolor="rgba(31, 119, 180, 0.15)",
-        )
-    )
-    fig.update_layout(
-        title="Evolución del nivel del tanque",
-        xaxis_title="Fecha",
-        yaxis_title="Volumen almacenado (m³)",
-        template="plotly_white",
-        hovermode="x unified",
-        margin=dict(l=40, r=20, t=50, b=40),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-    )
-    return fig
+# Límite de días por simulación para evitar series excesivamente largas en el navegador.
+_MAX_DIAS_SIMULACION = 365 * 15
 
 
 def main() -> None:
+    año_actual = date.today().year
     st.set_page_config(
         page_title="Aprovechamiento de agua lluvia — UCC",
         page_icon="💧",
@@ -439,24 +121,67 @@ def main() -> None:
 
         st.divider()
         st.subheader("Datos de precipitación")
+        rango_txt = f"{_MAX_DIAS_SIMULACION:,}".replace(",", ".")
+        fecha_desde = st.date_input(
+            "Fecha inicial del periodo",
+            value=date(año_actual, 1, 1),
+            help="Primer día incluido en la simulación (datos de archivo o serie sintética).",
+        )
+        fecha_hasta = st.date_input(
+            "Fecha final del periodo",
+            value=date(año_actual, 12, 31),
+            help="Último día incluido. El periodo total no puede superar "
+            f"{rango_txt} días (se acorta automáticamente).",
+        )
+        if fecha_hasta < fecha_desde:
+            st.sidebar.warning(
+                "La fecha final es anterior a la inicial; se usará un solo día (la fecha inicial)."
+            )
+            fecha_hasta = fecha_desde
+        dias_periodo = (fecha_hasta - fecha_desde).days + 1
+        if dias_periodo > _MAX_DIAS_SIMULACION:
+            st.sidebar.warning(
+                f"Periodo limitado a {_MAX_DIAS_SIMULACION:,} días; se ajustó la fecha final.".replace(
+                    ",", "."
+                )
+            )
+            fecha_hasta = fecha_desde + timedelta(days=_MAX_DIAS_SIMULACION - 1)
+            dias_periodo = _MAX_DIAS_SIMULACION
+        fecha_inicio_sim = datetime.combine(fecha_desde, time.min)
+
         archivo = st.file_uploader(
             "Subir CSV o Excel",
             type=["csv", "xlsx", "xls"],
             help=f"Columnas requeridas: '{COL_FECHA}' y '{COL_PRECIP}' (o nombres equivalentes).",
         )
 
+    etiqueta_periodo = f"{fecha_desde.isoformat()} → {fecha_hasta.isoformat()} ({dias_periodo} días)"
+
     # Datos: archivo o sintéticos
     try:
         if archivo is not None:
-            precip_df = cargar_precipitaciones(archivo)
-            st.session_state["origen_datos"] = f"Archivo: {archivo.name}"
+            precip_df = filtrar_precip_por_rango(cargar_precipitaciones(archivo), fecha_desde, fecha_hasta)
+            st.session_state["origen_datos"] = f"Archivo: {archivo.name} · {etiqueta_periodo}"
         else:
-            precip_df = generar_precipitacion_sintetica()
-            st.session_state["origen_datos"] = "Serie sintética (1 año)"
+            precip_df = generar_precipitacion_sintetica(
+                dias=dias_periodo,
+                fecha_inicio=fecha_inicio_sim,
+            )
+            st.session_state["origen_datos"] = f"Serie sintética · {etiqueta_periodo}"
     except Exception as e:
         st.error(str(e))
-        precip_df = generar_precipitacion_sintetica()
-        st.session_state["origen_datos"] = "Serie sintética (error al leer archivo)"
+        precip_df = generar_precipitacion_sintetica(
+            dias=dias_periodo,
+            fecha_inicio=fecha_inicio_sim,
+        )
+        st.session_state["origen_datos"] = f"Serie sintética (error al leer archivo) · {etiqueta_periodo}"
+
+    if precip_df.empty:
+        st.error(
+            "No hay datos de precipitación en el periodo seleccionado. "
+            "Amplíe el rango de fechas o revise el archivo."
+        )
+        st.stop()
 
     resultado = simular_aprovechamiento(
         precip_df,
@@ -518,9 +243,11 @@ def main() -> None:
 
     st.caption(f"Origen de precipitación: {st.session_state.get('origen_datos', '—')}")
 
+    st.subheader("Evolución del nivel del tanque")
     st.plotly_chart(grafico_nivel_tanque(resultado_eco), use_container_width=True)
 
     st.subheader("Captación vs. rebalse")
+    st.caption("Barras agrupadas: captación diaria y volumen rebosado.")
     st.plotly_chart(grafico_captacion_vs_rebose(resultado_eco), use_container_width=True)
     excel_bytes = build_excel_captacion_rebose_y_completo(resultado_eco)
     st.download_button(
@@ -531,6 +258,7 @@ def main() -> None:
     )
 
     st.subheader("Economía: ahorro acumulado")
+    st.caption("Serie dual: volumen de lluvia utilizada acumulada (m³) y ahorro acumulado (COP).")
     st.plotly_chart(grafico_ahorro_acumulado_dual(resultado_eco), use_container_width=True)
 
     st.subheader("Tabla de resultados")
