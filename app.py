@@ -8,6 +8,7 @@ este archivo solo define la interfaz web.
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -41,6 +42,35 @@ _PLOTLY_CONFIG: dict = {"displayModeBar": True, "responsive": True}
 
 # Límite de días por simulación para evitar series excesivamente largas en el navegador.
 _MAX_DIAS_SIMULACION = 365 * 15
+
+_PLANTILLA_FALLBACK_CSV = (
+    "Fecha,Precipitacion_mm\n"
+    "2026-01-01,0.0\n"
+    "2026-01-02,5.0\n"
+).encode("utf-8-sig")
+
+_MESES_CORTOS = (
+    "Ene",
+    "Feb",
+    "Mar",
+    "Abr",
+    "May",
+    "Jun",
+    "Jul",
+    "Ago",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dic",
+)
+
+
+def _bytes_plantilla_precipitacion() -> bytes:
+    ruta = Path(__file__).resolve().parent / "plantillas" / "precipitacion_diaria_plantilla.csv"
+    try:
+        return ruta.read_bytes()
+    except OSError:
+        return _PLANTILLA_FALLBACK_CSV
 
 
 def main() -> None:
@@ -127,6 +157,21 @@ def main() -> None:
 
         st.divider()
         st.subheader("Datos de precipitación")
+
+        archivo = st.file_uploader(
+            "Subir CSV o Excel",
+            type=["csv", "xlsx", "xls"],
+            help=f"Columnas requeridas: '{COL_FECHA}' y '{COL_PRECIP}' (o nombres equivalentes).",
+        )
+        st.download_button(
+            label="Descargar plantilla CSV",
+            data=_bytes_plantilla_precipitacion(),
+            file_name="plantilla_precipitacion_UCC.csv",
+            mime="text/csv; charset=utf-8",
+            use_container_width=True,
+            help="Formato esperado: una fila por día, columnas Fecha y Precipitacion_mm (mm/día).",
+        )
+
         rango_txt = f"{_MAX_DIAS_SIMULACION:,}".replace(",", ".")
         fecha_desde = st.date_input(
             "Fecha inicial del periodo",
@@ -155,13 +200,31 @@ def main() -> None:
             dias_periodo = _MAX_DIAS_SIMULACION
         fecha_inicio_sim = datetime.combine(fecha_desde, time.min)
 
-        archivo = st.file_uploader(
-            "Subir CSV o Excel",
-            type=["csv", "xlsx", "xls"],
-            help=f"Columnas requeridas: '{COL_FECHA}' y '{COL_PRECIP}' (o nombres equivalentes).",
-        )
+        meses_temporada_seca: list[int] = []
+        factor_lluvia_seca = 0.2
+        if archivo is None:
+            meses_temporada_seca = st.multiselect(
+                "Meses de temporada seca (serie sintética)",
+                options=list(range(1, 13)),
+                format_func=lambda m: _MESES_CORTOS[m - 1],
+                default=[11, 12, 1, 2, 3],
+                help=(
+                    "En esos meses de calendario se multiplica la lluvia sintética por el factor inferior "
+                    "(refuerza sequía típica p. ej. en zona andina). No aplica si subes un archivo propio."
+                ),
+            )
+            factor_lluvia_seca = st.slider(
+                "Factor de lluvia en temporada seca",
+                min_value=0.0,
+                max_value=1.0,
+                value=0.2,
+                step=0.05,
+                help="0 = sin precipitación en los meses seleccionados; 1 = no se reduce respecto al modelo base.",
+            )
 
     etiqueta_periodo = f"{fecha_desde.isoformat()} → {fecha_hasta.isoformat()} ({dias_periodo} días)"
+
+    meses_seca_fs = frozenset(meses_temporada_seca) if meses_temporada_seca else frozenset()
 
     # Datos: archivo o sintéticos
     try:
@@ -172,13 +235,21 @@ def main() -> None:
             precip_df = generar_precipitacion_sintetica(
                 dias=dias_periodo,
                 fecha_inicio=fecha_inicio_sim,
+                meses_temporada_seca=meses_seca_fs if meses_seca_fs else None,
+                factor_lluvia_en_seca=factor_lluvia_seca,
             )
-            st.session_state["origen_datos"] = f"Serie sintética · {etiqueta_periodo}"
+            suf = ""
+            if meses_seca_fs:
+                mes_txt = ", ".join(_MESES_CORTOS[m - 1] for m in sorted(meses_seca_fs))
+                suf = f" · Seca: {mes_txt} (×{factor_lluvia_seca:g})"
+            st.session_state["origen_datos"] = f"Serie sintética · {etiqueta_periodo}{suf}"
     except Exception as e:
         st.error(str(e))
         precip_df = generar_precipitacion_sintetica(
             dias=dias_periodo,
             fecha_inicio=fecha_inicio_sim,
+            meses_temporada_seca=meses_seca_fs if meses_seca_fs else None,
+            factor_lluvia_en_seca=factor_lluvia_seca,
         )
         st.session_state["origen_datos"] = f"Serie sintética (error al leer archivo) · {etiqueta_periodo}"
 

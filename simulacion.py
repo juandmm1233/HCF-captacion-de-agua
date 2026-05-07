@@ -29,6 +29,9 @@ def generar_precipitacion_sintetica(
     dias: int = 365,
     fecha_inicio: datetime | None = None,
     seed: int = 42,
+    *,
+    meses_temporada_seca: frozenset[int] | None = None,
+    factor_lluvia_en_seca: float = 0.2,
 ) -> pd.DataFrame:
     """
     Construye una serie temporal sintética de precipitación diaria en mm.
@@ -43,6 +46,9 @@ def generar_precipitacion_sintetica(
         3. Se suma **ruido positivo** con distribución Gamma (controlado por ``seed``) para
            variabilidad día a día; se resta un pequeño desplazamiento y se trunca en cero para
            que no existan precipitaciones negativas.
+        4. Si ``meses_temporada_seca`` contiene meses (1–12), cada día cuyo mes de calendario esté
+           en ese conjunto multiplica la lámina por ``factor_lluvia_en_seca`` (p. ej. 0.2 para endurecer
+           la estación seca; 0 para cero lluvia en esos meses).
 
     **Retorno:** ``DataFrame`` con columnas ``COL_FECHA`` y ``COL_PRECIP``.
     """
@@ -56,6 +62,14 @@ def generar_precipitacion_sintetica(
     estacional = 8.0 + 6.0 * np.sin(2 * np.pi * (doy - 80) / 365.0)
     ruido = rng.gamma(shape=1.2, scale=2.5, size=dias)
     precip = np.maximum(estacional + ruido - 3.0, 0.0)
+
+    meses_seca = meses_temporada_seca or frozenset()
+    if meses_seca:
+        fac = float(np.clip(factor_lluvia_en_seca, 0.0, 1.0))
+        mes_por_dia = np.array([d.month for d in fechas], dtype=np.int32)
+        seca = np.isin(mes_por_dia, np.array(list(meses_seca), dtype=np.int32))
+        precip = np.where(seca, precip * fac, precip)
+
     return pd.DataFrame({COL_FECHA: fechas, COL_PRECIP: precip})
 
 
