@@ -26,11 +26,17 @@ from simulacion import (
     generar_precipitacion_sintetica,
     grafico_ahorro_acumulado_dual,
     grafico_captacion_vs_rebose,
+    grafico_consumo_original_vs_lluvia_ucc,
     grafico_nivel_tanque,
+    metricas_consumo_mensual_demanda_vs_red,
     punto_equilibrio_anos,
     roi_anual_simple_pct,
     simular_aprovechamiento,
 )
+
+
+# Config Plotly para que el embed siga el ancho del contenedor al redimensionar la ventana
+_PLOTLY_CONFIG: dict = {"displayModeBar": True, "responsive": True}
 
 
 # Límite de días por simulación para evitar series excesivamente largas en el navegador.
@@ -243,12 +249,40 @@ def main() -> None:
 
     st.caption(f"Origen de precipitación: {st.session_state.get('origen_datos', '—')}")
 
+    st.subheader("Comparación: demanda vs. uso de red (agregado mensual)")
+    st.caption(
+        "Cada barra azul es la demanda de agua del mes (suma diaria según tu consumo en la barra lateral). "
+        "Cada barra verde es el volumen que siguió comprándose en red porque el tanque no cubrió el consumo. "
+        "Referencias: Universidad Cooperativa de Colombia · sede El Salado."
+    )
+    st.plotly_chart(
+        grafico_consumo_original_vs_lluvia_ucc(resultado_eco),
+        use_container_width=True,
+        config=_PLOTLY_CONFIG,
+    )
+    _m_con = metricas_consumo_mensual_demanda_vs_red(resultado_eco)
+    st.markdown(
+        f"**En el periodo simulado:** ahorro respecto a atender toda la demanda solo con red: "
+        f"{_m_con['ahorro_pct_periodo']:.1f} % "
+        f"({formato_miles_colombiano(_m_con['total_demanda_m3'], decimales=2)} → "
+        f"{formato_miles_colombiano(_m_con['total_potable_m3'], decimales=2)} m³).  \n"
+        f"**Promedio del % de ahorro entre meses con demanda:** {_m_con['ahorro_promedio_pct_meses']:.1f} %"
+    )
+
     st.subheader("Evolución del nivel del tanque")
-    st.plotly_chart(grafico_nivel_tanque(resultado_eco), use_container_width=True)
+    st.plotly_chart(
+        grafico_nivel_tanque(resultado_eco),
+        use_container_width=True,
+        config=_PLOTLY_CONFIG,
+    )
 
     st.subheader("Captación vs. rebalse")
     st.caption("Barras agrupadas: captación diaria y volumen rebosado.")
-    st.plotly_chart(grafico_captacion_vs_rebose(resultado_eco), use_container_width=True)
+    st.plotly_chart(
+        grafico_captacion_vs_rebose(resultado_eco),
+        use_container_width=True,
+        config=_PLOTLY_CONFIG,
+    )
     excel_bytes = build_excel_captacion_rebose_y_completo(resultado_eco)
     st.download_button(
         label="Descargar Excel (captación/rebalse y resultados completos)",
@@ -259,7 +293,11 @@ def main() -> None:
 
     st.subheader("Economía: ahorro acumulado")
     st.caption("Serie dual: volumen de lluvia utilizada acumulada (m³) y ahorro acumulado (COP).")
-    st.plotly_chart(grafico_ahorro_acumulado_dual(resultado_eco), use_container_width=True)
+    st.plotly_chart(
+        grafico_ahorro_acumulado_dual(resultado_eco),
+        use_container_width=True,
+        config=_PLOTLY_CONFIG,
+    )
 
     st.subheader("Tabla de resultados")
     display_df = resultado_eco.copy()

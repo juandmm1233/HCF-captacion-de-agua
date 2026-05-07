@@ -377,6 +377,7 @@ def _layout_grafico_responsive(
             x=0.5,
         ),
         margin=dict(l=left, r=right, t=top, b=bottom),
+        autosize=True,
     )
 
 
@@ -415,6 +416,150 @@ def grafico_captacion_vs_rebose(resultado: pd.DataFrame) -> go.Figure:
         hovermode="x unified",
     )
     _layout_grafico_responsive(fig)
+    return fig
+
+
+_MESES_ABR = (
+    "Ene",
+    "Feb",
+    "Mar",
+    "Abr",
+    "May",
+    "Jun",
+    "Jul",
+    "Ago",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dic",
+)
+
+
+def _agrupar_demanda_vs_red_mensual(resultado: pd.DataFrame) -> pd.DataFrame:
+    """Suma por mes natural: demanda total vs. volumen comprado en red (suplemento)."""
+    if resultado.empty:
+        return pd.DataFrame(columns=["_p", "mes_label", "demanda_m3", "potable_m3"])
+    df = resultado[[COL_FECHA, "Consumo_m3", "Agua_Potable_Suple_m3"]].copy()
+    df["_p"] = pd.to_datetime(df[COL_FECHA]).dt.to_period("M")
+    g = (
+        df.groupby("_p", as_index=False)
+        .agg(
+            demanda_m3=("Consumo_m3", "sum"),
+            potable_m3=("Agua_Potable_Suple_m3", "sum"),
+        )
+        .sort_values("_p")
+    )
+    g["mes_label"] = g["_p"].apply(lambda p: f"{_MESES_ABR[p.month - 1]} {p.year}")
+    return g
+
+
+def metricas_consumo_mensual_demanda_vs_red(resultado: pd.DataFrame) -> dict[str, float]:
+    """
+    Totales del periodo y porcentajes coherentes con el gráfico demanda vs. red suplementaria.
+
+    ``ahorro_pct_periodo``: fracción de demanda no cubierta con compra en red (uso efectivo de captación).
+    ``ahorro_promedio_pct_meses``: media del % mensual (un mes = suma diaria de ese mes).
+    """
+    g = _agrupar_demanda_vs_red_mensual(resultado)
+    total_dem = float(g["demanda_m3"].sum()) if len(g) else 0.0
+    total_pot = float(g["potable_m3"].sum()) if len(g) else 0.0
+    if total_dem <= 0:
+        return {
+            "total_demanda_m3": 0.0,
+            "total_potable_m3": 0.0,
+            "ahorro_pct_periodo": 0.0,
+            "ahorro_promedio_pct_meses": 0.0,
+        }
+    d = g["demanda_m3"].astype(float)
+    p = g["potable_m3"].astype(float)
+    ok = d > 0
+    pct_meses = ((d[ok] - p[ok]) / d[ok] * 100.0).to_numpy() if ok.any() else np.array([], dtype=float)
+    ahorro_pct_periodo = (total_dem - total_pot) / total_dem * 100.0
+    ahorro_prom_m = float(np.mean(pct_meses)) if len(pct_meses) else 0.0
+    return {
+        "total_demanda_m3": total_dem,
+        "total_potable_m3": total_pot,
+        "ahorro_pct_periodo": ahorro_pct_periodo,
+        "ahorro_promedio_pct_meses": ahorro_prom_m,
+    }
+
+
+def grafico_consumo_original_vs_lluvia_ucc(resultado: pd.DataFrame) -> go.Figure:
+    """
+    Barras agrupadas por **mes calendario**: demanda de agua total del periodo vs. volumen comprado en red.
+
+    La **demanda** es la suma mensual de ``Consumo_m3`` (parámetro de consumo diario × días del mes en la simulación).
+    La serie de **red** es la suma mensual de ``Agua_Potable_Suple_m3`` (déficit cubierto con agua potable cuando
+    el tanque no alcanza). Cambiar área, tanque, consumo, precipitación, etc. altera estos totales.
+
+    **Retorno:** ``go.Figure`` listo para ``st.plotly_chart``. Ver también ``metricas_consumo_mensual_demanda_vs_red``.
+    """
+    g = _agrupar_demanda_vs_red_mensual(resultado)
+    if g.empty:
+        fig = go.Figure()
+        fig.update_layout(
+            title=None,
+            template="plotly_white",
+            annotations=[
+                dict(
+                    text="No hay datos para construir el gráfico mensual.",
+                    xref="paper",
+                    yref="paper",
+                    x=0.5,
+                    y=0.5,
+                    showarrow=False,
+                    font=dict(size=14, color="#64748b"),
+                )
+            ],
+            xaxis=dict(visible=False),
+            yaxis=dict(visible=False),
+        )
+        _layout_grafico_responsive(fig)
+        return fig
+
+    n = len(g)
+    tickangle = -40 if n > 12 else 0
+    bottom_m = 128.0 if n > 12 else 92.0
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=g["mes_label"],
+            y=g["demanda_m3"],
+            name="Demanda total (referencia 100% red)",
+            marker_color="#1f77b4",
+            marker_line=dict(color="white", width=1),
+            hovertemplate="%{x}<br>Demanda: %{y:.2f} m³<extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Bar(
+            x=g["mes_label"],
+            y=g["potable_m3"],
+            name="Agua de red con el sistema",
+            marker_color="#2ca02c",
+            marker_line=dict(color="white", width=1),
+            hovertemplate="%{x}<br>Red suplementaria: %{y:.2f} m³<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        title=None,
+        barmode="group",
+        xaxis_title="Mes (periodo simulado)",
+        yaxis_title="Volumen (m³/mes)",
+        template="plotly_white",
+        hovermode="x unified",
+        xaxis=dict(automargin=True, tickangle=tickangle),
+        yaxis=dict(
+            showgrid=True,
+            gridcolor="#dddddd",
+            rangemode="tozero",
+            automargin=True,
+        ),
+        bargap=0.14,
+        bargroupgap=0.06,
+    )
+    _layout_grafico_responsive(fig, bottom=bottom_m)
     return fig
 
 

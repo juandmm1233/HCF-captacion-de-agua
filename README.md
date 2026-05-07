@@ -34,7 +34,7 @@ Accede a **http://localhost:8501**.
 ### Docker Compose
 
 ```bash
-docker compose up --build
+docker build -t ucc-agua-lluviad
 ```
 
 Misma URL; el servicio queda definido en `docker-compose.yml`.
