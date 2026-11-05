@@ -13,7 +13,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py simulacion.py .
+COPY app.py simulacion.py ./
 COPY plantillas/ plantillas/
 
 EXPOSE 8501
